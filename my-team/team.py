@@ -170,7 +170,53 @@ class MyTeam(TeamController):
                     ),
                 )
                 if keeper_should_clear:
-                    if obs.can_kick(player.id):
+                    ball_is_heading_wide = False
+
+                    if obs.ball.velocity[0] < -0.1:
+                        time_to_goal = (
+                            obs.field.my_goal[0] - obs.ball.position[0]
+                        ) / obs.ball.velocity[0]
+                        predicted_goal_y = (
+                            obs.ball.position[1]
+                            + obs.ball.velocity[1] * time_to_goal
+                        )
+                        ball_is_heading_wide = (
+                            abs(predicted_goal_y)
+                            > obs.field.goal_width / 2
+                        )
+
+                    if obs.can_kick(player.id) and ball_is_heading_wide:
+                        # It is already missing the goal. Touching it could
+                        # redirect a harmless ball between the posts.
+                        actions.set(player.id, PlayerAction.noop())
+
+                    elif (
+                        obs.can_kick(player.id)
+                        and obs.ball.velocity[0] < -10.0
+                    ):
+                        # Meet a fast on-target shot straight on. This puts
+                        # all available kick force into stopping its movement
+                        # toward our goal instead of deflecting it across goal.
+                        straight_clear_target = (
+                            obs.ball.position[0] + 30.0,
+                            obs.ball.position[1],
+                        )
+                        actions.set(
+                            player.id,
+                            PlayerAction(
+                                movement=direction(
+                                    player.position,
+                                    keeper_clear_target,
+                                ),
+                                kick_direction=direction(
+                                    obs.ball.position,
+                                    straight_clear_target,
+                                ),
+                                kick_power=1.0,
+                            ),
+                        )
+
+                    elif obs.can_kick(player.id):
                         opponents_above = sum(
                             1
                             for opponent in obs.opponents
@@ -210,11 +256,27 @@ class MyTeam(TeamController):
                             ),
                         )
                     else:
+                        if player.kick_cooldown_ticks > 0:
+                            recovery_y = max(
+                                -obs.field.goal_width / 2,
+                                min(
+                                    obs.ball.position[1],
+                                    obs.field.goal_width / 2,
+                                ),
+                            )
+                            recovery_target = (
+                                obs.field.my_goal[0]
+                                + obs.field.player_radius * 2,
+                                recovery_y,
+                            )
+                        else:
+                            recovery_target = keeper_clear_target
+
                         actions.move(
                             player.id,
                             direction(
                                 player.position,
-                                keeper_clear_target,
+                                recovery_target,
                             ),
                         )
 
@@ -427,8 +489,10 @@ class MyTeam(TeamController):
                     )
 
                     shooting_distance = 25.0
+                    kick_origin = player.position
 
                     if distance_to_goal_squared <= shooting_distance ** 2:
+                        kick_origin = obs.ball.position
                         # Close enough: shoot away from the goalkeeper.
                         opponent_keeper = obs.opponents[0]
 
@@ -437,7 +501,15 @@ class MyTeam(TeamController):
                             - obs.field.player_radius
                         )
 
-                        if opponent_keeper.position[1] >= 0:
+                        keeper_to_goal_squared = (
+                            (opponent_keeper.position[0] - goal_x) ** 2
+                            + (opponent_keeper.position[1] - goal_y) ** 2
+                        )
+
+                        if keeper_to_goal_squared > 8.0 ** 2:
+                            # The chasing keeper has abandoned the goal.
+                            shot_y = goal_y
+                        elif opponent_keeper.position[1] >= 0:
                             # Keeper is covering the upper side.
                             shot_y = -shot_limit
                         else:
@@ -458,6 +530,26 @@ class MyTeam(TeamController):
                             for teammate in outfield_players
                             if teammate.id != player.id
                         ]
+                        rear_pressure_count = sum(
+                            1
+                            for opponent in obs.opponents
+                            if (
+                                opponent.position[0] <= player.position[0] + 2.0
+                                and (
+                                    (opponent.position[0] - player.position[0]) ** 2
+                                    + (opponent.position[1] - player.position[1]) ** 2
+                                    <= 12.0 ** 2
+                                )
+                            )
+                        )
+                        forward_teammates = [
+                            teammate
+                            for teammate in teammates
+                            if teammate.position[0] > player.position[0] + 3.0
+                        ]
+
+                        if forward_teammates and rear_pressure_count < 3:
+                            teammates = forward_teammates
 
                         def pass_score(teammate):
                             nearest_opponent_distance_squared = min(
@@ -472,6 +564,12 @@ class MyTeam(TeamController):
                                 teammate.position[0]
                                 - player.position[0]
                             )
+
+                            if rear_pressure_count >= 3:
+                                return (
+                                    2.0 * nearest_opponent_distance_squared
+                                    + 3.0 * forward_progress
+                                )
 
                             return (
                                 nearest_opponent_distance_squared
@@ -491,6 +589,15 @@ class MyTeam(TeamController):
                         )
 
                         receiver_is_open = receiver_space_squared >= 6.0 ** 2
+                        opponents_near_carrier = sum(
+                            1
+                            for opponent in obs.opponents
+                            if (
+                                (opponent.position[0] - player.position[0]) ** 2
+                                + (opponent.position[1] - player.position[1]) ** 2
+                                <= 12.0 ** 2
+                            )
+                        )
                         # Check whether an opponent blocks the passing lane.
                         pass_dx = receiver.position[0] - player.position[0]
                         pass_dy = receiver.position[1] - player.position[1]
@@ -538,11 +645,36 @@ class MyTeam(TeamController):
                                     pass_lane_is_clear = False
                                     break
 
-                        if (receiver.position[0] > player.position[0] + 3.0 and receiver_is_open and pass_lane_is_clear):
-                            # A teammate is clearly ahead: pass to them.
+                        receiver_is_forward = (
+                            receiver.position[0] > player.position[0] + 3.0
+                        )
+                        receiver_is_safe_escape = (
+                            rear_pressure_count >= 3
+                            and receiver.position[0] >= player.position[0] - 6.0
+                        )
+
+                        if (
+                            (receiver_is_forward or receiver_is_safe_escape)
+                            and receiver_is_open
+                            and pass_lane_is_clear
+                        ):
+                            # Lead an available teammate beyond the group
+                            # chasing the ball instead of passing to their feet.
+                            use_through_ball = (
+                                player.id >= 3
+                                and opponents_near_carrier >= 3
+                            )
+
+                            if use_through_ball:
+                                pass_lead = 8.0
+                            elif receiver_is_safe_escape:
+                                pass_lead = 2.0
+                            else:
+                                pass_lead = 4.0
+
                             kick_target = (
                                 min(
-                                    receiver.position[0] + 4.0,
+                                    receiver.position[0] + pass_lead,
                                     obs.opponent_goal[0] - 2.0,
                                 ),
                                 receiver.position[1],
@@ -552,13 +684,16 @@ class MyTeam(TeamController):
                                 + (player.position[1] - kick_target[1]) ** 2
                             ) ** 0.5
 
-                            kick_power = max(
-                                0.35,
-                                min(
-                                    pass_distance / 30.0,
-                                    0.8,
-                                ),
-                            )
+                            if use_through_ball:
+                                kick_power = max(
+                                    0.40,
+                                    min(pass_distance / 26.0, 0.85),
+                                )
+                            else:
+                                kick_power = max(
+                                    0.35,
+                                    min(pass_distance / 30.0, 0.8),
+                                )
                         else:
                             # Nobody is safely available: compare several
                             # forward lanes and dribble into the best one.
@@ -619,7 +754,7 @@ class MyTeam(TeamController):
                                 kick_target,
                             ),
                             kick_direction=direction(
-                                player.position,
+                                kick_origin,
                                 kick_target,
                             ),
                             kick_power=kick_power,
