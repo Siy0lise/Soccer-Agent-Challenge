@@ -53,12 +53,16 @@ class MyTeam(TeamController):
     pass_receiver_id = None
     pass_target = None
     pass_follow_until = -1
+    quick_shot_player_id = None
+    quick_shot_until = -1
 
     def reset(self, seed):
         self.restart_wait_until = -1
         self.pass_receiver_id = None
         self.pass_target = None
         self.pass_follow_until = -1
+        self.quick_shot_player_id = None
+        self.quick_shot_until = -1
 
     def initial_formation(self, field):
         """Where your team stands at every kickoff. Optional — delete for the default.
@@ -98,6 +102,13 @@ class MyTeam(TeamController):
             obs.time_remaining <= 0.10
             and obs.score[0] >= obs.score[1]
         )
+
+        if (
+            obs.tick > self.quick_shot_until
+            or obs.ball.controlling_team == 1
+        ):
+            self.quick_shot_player_id = None
+            self.quick_shot_until = -1
 
         for event in obs.events:
             if event.get("kind") == "goal" and event.get("team") == 0:
@@ -143,6 +154,56 @@ class MyTeam(TeamController):
         keeper = obs.my_players[0]
         defenders = obs.my_players[1:3]
         outfield_players = obs.my_players[1:]
+
+        coordinated_attack = (
+            ours
+            and not protecting_late_result
+            and obs.ball.position[0] >= obs.opponent_goal[0] - 30.0
+        )
+        coordinated_run_targets = {}
+
+        if coordinated_attack:
+            carrier = next(
+                (
+                    player
+                    for player in outfield_players
+                    if player.has_control
+                ),
+                None,
+            )
+            available_attackers = [
+                player
+                for player in obs.my_players[3:]
+                if carrier is None or player.id != carrier.id
+            ]
+            ball_side = -1.0 if obs.ball.position[1] < 0.0 else 1.0
+            crossing_target = (
+                min(obs.ball.position[0] + 8.0, obs.opponent_goal[0] - 8.0),
+                -ball_side * 3.0,
+            )
+            far_post_target = (
+                obs.opponent_goal[0] - 6.0,
+                -ball_side * (obs.field.goal_width / 2 - 2.0),
+            )
+
+            if available_attackers:
+                crossing_runner = min(
+                    available_attackers,
+                    key=lambda player: (
+                        (player.position[0] - crossing_target[0]) ** 2
+                        + (player.position[1] - crossing_target[1]) ** 2
+                    ),
+                )
+                coordinated_run_targets[crossing_runner.id] = crossing_target
+                remaining_attackers = [
+                    player
+                    for player in available_attackers
+                    if player.id != crossing_runner.id
+                ]
+
+                if remaining_attackers:
+                    far_post_runner = remaining_attackers[0]
+                    coordinated_run_targets[far_post_runner.id] = far_post_target
 
         def ball_distance_squared(player):
             dx = player.position[0] - obs.ball.position[0]
@@ -540,7 +601,13 @@ class MyTeam(TeamController):
                         + (player.position[1] - goal_y) ** 2
                     )
 
-                    shooting_distance = 25.0
+                    quick_shot_opportunity = (
+                        player.id == self.quick_shot_player_id
+                        and obs.tick <= self.quick_shot_until
+                    )
+                    shooting_distance = (
+                        30.0 if quick_shot_opportunity else 25.0
+                    )
                     kick_origin = player.position
                     shot_is_in_range = (
                         distance_to_goal_squared <= shooting_distance ** 2
@@ -629,6 +696,8 @@ class MyTeam(TeamController):
                         kick_origin = obs.ball.position
                         kick_target = shot_target
                         kick_power = 1.0
+                        self.quick_shot_player_id = None
+                        self.quick_shot_until = -1
 
                     else:
                         # Find the furthest-forward teammate.
@@ -688,18 +757,29 @@ class MyTeam(TeamController):
                                 (teammate.position[0] - player.position[0]) ** 2
                                 + (teammate.position[1] - player.position[1]) ** 2
                             )
+                            coordinated_run_bonus = 0.0
+                            if teammate.id in coordinated_run_targets:
+                                run_target = coordinated_run_targets[teammate.id]
+                                run_distance_squared = (
+                                    (teammate.position[0] - run_target[0]) ** 2
+                                    + (teammate.position[1] - run_target[1]) ** 2
+                                )
+                                if run_distance_squared <= 6.0 ** 2:
+                                    coordinated_run_bonus = 120.0
 
                             if rear_pressure_count >= 3:
                                 return (
                                     2.0 * nearest_opponent_distance_squared
                                     + 3.0 * forward_progress
                                     - 0.15 * pass_distance_squared
+                                    + coordinated_run_bonus
                                 )
 
                             return (
                                 nearest_opponent_distance_squared
                                 + 6.0 * forward_progress
                                 - 0.25 * pass_distance_squared
+                                + coordinated_run_bonus
                             )
 
                         receiver = max(
@@ -845,13 +925,25 @@ class MyTeam(TeamController):
                             else:
                                 pass_lead = 4.0
 
-                            kick_target = (
-                                min(
-                                    receiver.position[0] + pass_lead,
-                                    obs.opponent_goal[0] - 2.0,
-                                ),
-                                receiver.position[1],
-                            )
+                            receiver_has_completed_run = False
+                            if receiver.id in coordinated_run_targets:
+                                run_target = coordinated_run_targets[receiver.id]
+                                receiver_has_completed_run = (
+                                    (receiver.position[0] - run_target[0]) ** 2
+                                    + (receiver.position[1] - run_target[1]) ** 2
+                                    <= 6.0 ** 2
+                                )
+
+                            if receiver_has_completed_run:
+                                kick_target = coordinated_run_targets[receiver.id]
+                            else:
+                                kick_target = (
+                                    min(
+                                        receiver.position[0] + pass_lead,
+                                        obs.opponent_goal[0] - 2.0,
+                                    ),
+                                    receiver.position[1],
+                                )
                             pass_distance = (
                                 (player.position[0] - kick_target[0]) ** 2
                                 + (player.position[1] - kick_target[1]) ** 2
@@ -869,6 +961,9 @@ class MyTeam(TeamController):
 
                             self.pass_receiver_id = receiver.id
                             self.pass_target = kick_target
+                            if coordinated_attack:
+                                self.quick_shot_player_id = receiver.id
+                                self.quick_shot_until = obs.tick + 24
                             receiver_commitment = int(
                                 max(
                                     12.0,
@@ -885,9 +980,14 @@ class MyTeam(TeamController):
                                 player.position[0] + 7.0,
                                 obs.opponent_goal[0] - 2.0,
                             )
-                            lane_y_values = (
-                                -18.0, -12.0, -6.0, 0.0, 6.0, 12.0, 18.0
-                            )
+                            if coordinated_attack:
+                                lane_y_values = (-6.0, 0.0, 6.0)
+                            else:
+                                lane_y_values = (
+                                    -18.0, -12.0, -6.0,
+                                    0.0,
+                                    6.0, 12.0, 18.0,
+                                )
 
                             def lane_score(target_y):
                                 lane_dx = target_x - player.position[0]
@@ -1022,7 +1122,13 @@ class MyTeam(TeamController):
                     else:
                         attacking_midfielder_id = 2
 
-                if player.id == rebound_supporter_id:
+                if player.id in coordinated_run_targets:
+                    # In the final third, supporting attackers make distinct
+                    # crossing and far-post runs instead of occupying the same
+                    # channel as the carrier.
+                    target_x, target_y = coordinated_run_targets[player.id]
+
+                elif player.id == rebound_supporter_id:
                     # While a shot is travelling, one attacker anticipates a
                     # loose save without committing a defender or chasing a
                     # fixed target after the situation has changed.
