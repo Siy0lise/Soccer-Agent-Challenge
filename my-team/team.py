@@ -50,6 +50,9 @@ class MyTeam(TeamController):
     name = "SYOZAEATS"
     version = "1"
 
+    def reset(self, seed):
+        self.restart_wait_until = -1
+
     def initial_formation(self, field):
         """Where your team stands at every kickoff. Optional — delete for the default.
 
@@ -84,6 +87,24 @@ class MyTeam(TeamController):
         """
         actions = TeamAction()
         ours = obs.ball.controlling_team == 0
+
+        for event in obs.events:
+            if event.get("kind") == "goal" and event.get("team") == 0:
+                self.restart_wait_until = obs.tick + 59
+
+        ball_at_centre = (
+            obs.ball.position[0] ** 2 + obs.ball.position[1] ** 2
+            <= 1.0 ** 2
+        )
+        ball_is_stationary = (
+            obs.ball.velocity[0] ** 2 + obs.ball.velocity[1] ** 2
+            <= 0.05 ** 2
+        )
+        do_nothing_restart = (
+            not ours
+            and ball_at_centre
+            and ball_is_stationary
+        )
 
                 # Select the chaser.
         keeper = obs.my_players[0]
@@ -327,6 +348,69 @@ class MyTeam(TeamController):
                     )
                 continue
 
+            if do_nothing_restart:
+                restart_is_live = obs.tick >= self.restart_wait_until
+
+                if player.id == 3:
+                    if restart_is_live:
+                        if obs.can_kick(player.id):
+                            restart_target = (8.0, 0.0)
+                            actions.set(
+                                player.id,
+                                PlayerAction(
+                                    movement=direction(
+                                        player.position,
+                                        restart_target,
+                                    ),
+                                    kick_direction=direction(
+                                        player.position,
+                                        restart_target,
+                                    ),
+                                    kick_power=0.25,
+                                ),
+                            )
+                        else:
+                            actions.move(
+                                player.id,
+                                direction(player.position, obs.ball.position),
+                            )
+                    else:
+                        collector_wait_target = (
+                            -obs.field.centre_circle_radius - 1.0,
+                            0.0,
+                        )
+                        actions.move(
+                            player.id,
+                            direction(player.position, collector_wait_target),
+                        )
+
+                elif player.id == 4:
+                    if restart_is_live:
+                        receiver_target = (8.0, 8.0)
+                    else:
+                        receiver_target = (
+                            -obs.field.centre_circle_radius - 1.0,
+                            8.0,
+                        )
+                    actions.move(
+                        player.id,
+                        direction(player.position, receiver_target),
+                    )
+
+                elif player.id == 1:
+                    actions.move(
+                        player.id,
+                        direction(player.position, (-20.0, -12.0)),
+                    )
+
+                else:
+                    actions.move(
+                        player.id,
+                        direction(player.position, (-20.0, 12.0)),
+                    )
+
+                continue
+
             nearest = player.id == chaser_id
 
             if ours and nearest:
@@ -476,33 +560,55 @@ class MyTeam(TeamController):
                                 ),
                             )
                         else:
-                            # Nobody is safely available: dribble away
-                            # from the nearest opponent.
-                            nearest_opponent = min(
-                                obs.opponents,
-                                key=lambda opponent: (
-                                    (player.position[0] - opponent.position[0]) ** 2
-                                    + (player.position[1] - opponent.position[1]) ** 2
-                                ),
+                            # Nobody is safely available: compare several
+                            # forward lanes and dribble into the best one.
+                            target_x = min(
+                                player.position[0] + 7.0,
+                                obs.opponent_goal[0] - 2.0,
+                            )
+                            lane_y_values = (
+                                -18.0, -12.0, -6.0, 0.0, 6.0, 12.0, 18.0
                             )
 
-                            if nearest_opponent.position[1] >= player.position[1]:
-                                # Opponent is above us: move down.
-                                dribble_y = player.position[1] - 6.0
-                            else:
-                                # Opponent is below us: move up.
-                                dribble_y = player.position[1] + 6.0
+                            def lane_score(target_y):
+                                lane_dx = target_x - player.position[0]
+                                lane_dy = target_y - player.position[1]
+                                lane_length_squared = (
+                                    lane_dx * lane_dx + lane_dy * lane_dy
+                                )
+                                clearance_squared = float("inf")
 
-                            # Keep the target safely inside the pitch.
-                            dribble_y = max(
-                                -20.0,
-                                min(dribble_y, 20.0),
-                            )
+                                for opponent in obs.opponents:
+                                    opponent_dx = (
+                                        opponent.position[0] - player.position[0]
+                                    )
+                                    opponent_dy = (
+                                        opponent.position[1] - player.position[1]
+                                    )
+                                    t = (
+                                        opponent_dx * lane_dx
+                                        + opponent_dy * lane_dy
+                                    ) / lane_length_squared
+                                    t = max(0.0, min(1.0, t))
+                                    closest_x = player.position[0] + t * lane_dx
+                                    closest_y = player.position[1] + t * lane_dy
+                                    distance_squared = (
+                                        (opponent.position[0] - closest_x) ** 2
+                                        + (opponent.position[1] - closest_y) ** 2
+                                    )
+                                    clearance_squared = min(
+                                        clearance_squared,
+                                        distance_squared,
+                                    )
 
-                            kick_target = (
-                                player.position[0] + 6.0,
-                                dribble_y,
-                            )
+                                return (
+                                    min(clearance_squared, 100.0)
+                                    - 0.8 * abs(target_y)
+                                    - 0.5 * abs(target_y - player.position[1])
+                                )
+
+                            dribble_y = max(lane_y_values, key=lane_score)
+                            kick_target = (target_x, dribble_y)
                             kick_power = 0.25
 
                     actions.set(
