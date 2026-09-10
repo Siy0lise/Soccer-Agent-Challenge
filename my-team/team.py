@@ -55,6 +55,10 @@ class MyTeam(TeamController):
     pass_follow_until = -1
     quick_shot_player_id = None
     quick_shot_until = -1
+    attacking_lane_phase = 0
+    had_possession_last_tick = False
+    second_ball_player_id = None
+    second_ball_until = -1
 
     def reset(self, seed):
         self.restart_wait_until = -1
@@ -63,6 +67,10 @@ class MyTeam(TeamController):
         self.pass_follow_until = -1
         self.quick_shot_player_id = None
         self.quick_shot_until = -1
+        self.attacking_lane_phase = 0
+        self.had_possession_last_tick = False
+        self.second_ball_player_id = None
+        self.second_ball_until = -1
 
     def initial_formation(self, field):
         """Where your team stands at every kickoff. Optional — delete for the default.
@@ -83,6 +91,111 @@ class MyTeam(TeamController):
             (forward_x, 6.0),       # right forward
         ]
 
+    @staticmethod
+    def distance_squared(first_position, second_position):
+        """Squared distance, avoiding a square root when comparing players."""
+        dx = first_position[0] - second_position[0]
+        dy = first_position[1] - second_position[1]
+        return dx * dx + dy * dy
+
+    def lane_clearance_squared(self, start, target, opponents):
+        """Return the smallest squared distance from an opponent to a lane."""
+        lane_dx = target[0] - start[0]
+        lane_dy = target[1] - start[1]
+        lane_length_squared = lane_dx * lane_dx + lane_dy * lane_dy
+
+        if lane_length_squared == 0.0:
+            return 0.0
+
+        minimum_clearance_squared = float("inf")
+
+        for opponent in opponents:
+            opponent_dx = opponent.position[0] - start[0]
+            opponent_dy = opponent.position[1] - start[1]
+            progress = (
+                opponent_dx * lane_dx + opponent_dy * lane_dy
+            ) / lane_length_squared
+            progress = max(0.0, min(progress, 1.0))
+            closest_point = (
+                start[0] + progress * lane_dx,
+                start[1] + progress * lane_dy,
+            )
+            minimum_clearance_squared = min(
+                minimum_clearance_squared,
+                self.distance_squared(opponent.position, closest_point),
+            )
+
+        return minimum_clearance_squared
+
+    def defensive_challenge_action(self, obs, player):
+        """Challenge for the ball without clearing it away unnecessarily."""
+        emergency_tackle = (
+            obs.ball.position[0]
+            < obs.field.my_goal[0] + 25.0
+        )
+
+        if emergency_tackle:
+            # Preserve the strong wide clearance near our goal.
+            tackle_target_y = (
+                18.0 if obs.ball.position[1] >= 0.0 else -18.0
+            )
+            tackle_target = (
+                min(
+                    obs.ball.position[0] + 25.0,
+                    obs.opponent_goal[0] - 5.0,
+                ),
+                tackle_target_y,
+            )
+            tackle_power = 1.0
+        else:
+            # Farther upfield, greedily choose a safe short forward lane while
+            # preferring useful central space over an empty touchline.
+            tackle_target_x = min(
+                obs.ball.position[0] + 8.0,
+                obs.opponent_goal[0] - 2.0,
+            )
+            maximum_target_y = obs.field.height / 2 - 3.0
+            tackle_targets = [
+                (
+                    tackle_target_x,
+                    max(
+                        -maximum_target_y,
+                        min(
+                            obs.ball.position[1] + lane_offset,
+                            maximum_target_y,
+                        ),
+                    ),
+                )
+                for lane_offset in (-6.0, 0.0, 6.0)
+            ]
+            tackle_target = max(
+                tackle_targets,
+                key=lambda target: (
+                    min(
+                        self.lane_clearance_squared(
+                            obs.ball.position,
+                            target,
+                            obs.opponents,
+                        ),
+                        64.0,
+                    )
+                    - 1.5 * abs(target[1])
+                ),
+            )
+            tackle_power = 0.3
+
+        return PlayerAction(
+            movement=direction(
+                player.position,
+                obs.ball.position,
+            ),
+            kick_direction=direction(
+                obs.ball.position,
+                tackle_target,
+            ),
+            kick_power=tackle_power,
+        )
+
     def act(self, obs):
         """Called on every tick. Return one action per player.
 
@@ -98,6 +211,9 @@ class MyTeam(TeamController):
         """
         actions = TeamAction()
         ours = obs.ball.controlling_team == 0
+        if ours and not self.had_possession_last_tick:
+            self.attacking_lane_phase = 1 - self.attacking_lane_phase
+        self.had_possession_last_tick = ours
         protecting_late_result = (
             obs.time_remaining <= 0.10
             and obs.score[0] >= obs.score[1]
@@ -205,10 +321,18 @@ class MyTeam(TeamController):
                     far_post_runner = remaining_attackers[0]
                     coordinated_run_targets[far_post_runner.id] = far_post_target
 
+        # Calculate each player's ball distance once this tick and reuse it
+        # for chaser selection, role assignment, and second-ball selection.
+        ball_distances_squared = {
+            player.id: self.distance_squared(
+                player.position,
+                obs.ball.position,
+            )
+            for player in obs.my_players
+        }
+
         def ball_distance_squared(player):
-            dx = player.position[0] - obs.ball.position[0]
-            dy = player.position[1] - obs.ball.position[1]
-            return dx * dx + dy * dy
+            return ball_distances_squared[player.id]
 
         def receiver_target(receiver):
             distance_to_ball_squared = (
@@ -239,6 +363,66 @@ class MyTeam(TeamController):
                 outfield_players,
                 key=ball_distance_squared,
             ).id
+
+        # Outfield responsibilities follow the play rather than belonging to
+        # permanent player numbers. One presses, one protects, one supports,
+        # and one stays ahead as the attacking outlet.
+        role_chaser = min(
+            outfield_players,
+            key=ball_distance_squared,
+        )
+        dynamic_roles = {role_chaser.id: "chaser"}
+        unassigned = [
+            player
+            for player in outfield_players
+            if player.id != role_chaser.id
+        ]
+        role_defender = min(
+            unassigned,
+            key=lambda player: player.position[0],
+        )
+        dynamic_roles[role_defender.id] = "defender"
+        unassigned = [
+            player
+            for player in unassigned
+            if player.id != role_defender.id
+        ]
+        role_striker = max(
+            unassigned,
+            key=lambda player: player.position[0],
+        )
+        dynamic_roles[role_striker.id] = "striker"
+        role_support = next(
+            player
+            for player in unassigned
+            if player.id != role_striker.id
+        )
+        dynamic_roles[role_support.id] = "support"
+
+        if ours or obs.tick > self.second_ball_until:
+            self.second_ball_player_id = None
+            self.second_ball_until = -1
+
+        lost_ball_this_tick = any(
+            event.get("kind") == "turnover"
+            and event.get("from_team") == 0
+            and event.get("to_team") == 1
+            for event in obs.events
+        )
+        counterpress_is_safe = (
+            obs.ball.position[0] > obs.field.my_goal[0] + 25.0
+        )
+
+        if lost_ball_this_tick and counterpress_is_safe:
+            # The normal chaser attacks the loose ball. Add the nearer of the
+            # support and striker briefly, while the dynamic defender stays
+            # behind the play as protection.
+            second_ball_player = min(
+                (role_support, role_striker),
+                key=ball_distance_squared,
+            )
+            self.second_ball_player_id = second_ball_player.id
+            self.second_ball_until = obs.tick + 16
 
         for player in obs.my_players:
             # GOALKEEPER
@@ -275,6 +459,7 @@ class MyTeam(TeamController):
                     ),
                 )
                 ball_is_heading_wide = False
+                incoming_shot_y = None
 
                 if obs.ball.velocity[0] < -0.1:
                     time_to_goal = (
@@ -288,11 +473,55 @@ class MyTeam(TeamController):
                         abs(predicted_goal_y)
                         > obs.field.goal_width / 2
                     )
+                    if (
+                        0.0 <= time_to_goal <= 3.0
+                        and not ball_is_heading_wide
+                    ):
+                        incoming_shot_y = predicted_goal_y
 
                 if ball_is_heading_wide:
-                    # It is already missing the goal. Touching it could
-                    # redirect a harmless ball between the posts.
-                    actions.set(player.id, PlayerAction.noop())
+                    opponent_near_wide_ball = any(
+                        self.distance_squared(
+                            opponent.position,
+                            obs.ball.position,
+                        ) <= 6.0 ** 2
+                        for opponent in obs.opponents
+                    )
+                    wide_ball_can_be_shot = (
+                        opponent_near_wide_ball
+                        and obs.ball.position[0]
+                        < obs.field.my_goal[0] + 18.0
+                    )
+
+                    if wide_ball_can_be_shot:
+                        # A nearby attacker can still shoot across goal, so
+                        # cover the near post without leaving the goal mouth.
+                        near_post_limit = (
+                            obs.field.goal_width / 2
+                            - obs.field.player_radius
+                        )
+                        keeper_wide_target = (
+                            keeper_min_x,
+                            max(
+                                -near_post_limit,
+                                min(
+                                    obs.ball.position[1],
+                                    near_post_limit,
+                                ),
+                            ),
+                        )
+                    else:
+                        # The ball is already missing the goal and no nearby
+                        # attacker can redirect it, so safely recenter.
+                        keeper_wide_target = (keeper_min_x, 0.0)
+
+                    actions.move(
+                        player.id,
+                        direction(
+                            player.position,
+                            keeper_wide_target,
+                        ),
+                    )
                     continue
 
                 if keeper_should_clear:
@@ -398,12 +627,18 @@ class MyTeam(TeamController):
                     - obs.field.player_radius
                 )
 
-                # Follow the ball vertically.
-                # Prevent leaving the goal mouth.
+                # Follow ordinary play vertically. For an incoming shot,
+                # move toward where it will cross the goal line instead of
+                # chasing its current position and reacting too late.
+                keeper_tracking_y = (
+                    incoming_shot_y
+                    if incoming_shot_y is not None
+                    else obs.ball.position[1]
+                )
                 keeper_y = max(
                     -keeper_limt,
                     min(
-                        obs.ball.position[1],
+                        keeper_tracking_y,
                         keeper_limt,
                     ),
                 )
@@ -442,7 +677,11 @@ class MyTeam(TeamController):
 
                         minimum_space_squared = float("inf")
 
-                        for opponent in obs.opponents:
+                        # A clearance lane is unsafe if either an opponent or
+                        # one of our outfield players can collide with it.
+                        # The latter can reverse a good clearance into our
+                        # own goal, so both teams must be considered here.
+                        for opponent in [*obs.opponents, *outfield_players]:
                             opponent_dx = (
                                 opponent.position[0]
                                 - obs.ball.position[0]
@@ -605,8 +844,23 @@ class MyTeam(TeamController):
                         player.id == self.quick_shot_player_id
                         and obs.tick <= self.quick_shot_until
                     )
+                    decisive_shot_opportunity = (
+                        dynamic_roles[player.id] in (
+                            "chaser",
+                            "support",
+                            "striker",
+                        )
+                        and player.position[0]
+                        >= obs.opponent_goal[0] - 32.0
+                        and abs(player.position[1] - goal_y)
+                        <= obs.field.goal_width / 2 + 8.0
+                    )
                     shooting_distance = (
-                        30.0 if quick_shot_opportunity else 25.0
+                        32.0
+                        if decisive_shot_opportunity
+                        else 30.0
+                        if quick_shot_opportunity
+                        else 25.0
                     )
                     kick_origin = player.position
                     shot_is_in_range = (
@@ -676,12 +930,27 @@ class MyTeam(TeamController):
 
                         return shot_quality, minimum_clearance_squared
 
-                    shot_target = max(shot_targets, key=shot_lane_clearance)
-                    best_shot_clearance_squared = shot_lane_clearance(
-                        shot_target
-                    )[1]
+                    shot_options = [
+                        (target, shot_lane_clearance(target))
+                        for target in shot_targets
+                    ]
+                    shot_target, best_shot_measurement = max(
+                        shot_options,
+                        key=lambda option: option[1][0],
+                    )
+                    best_shot_clearance_squared = (
+                        best_shot_measurement[1]
+                    )
+                    close_range_finish = (
+                        distance_to_goal_squared <= 15.0 ** 2
+                    )
+                    required_shot_clearance = (
+                        obs.field.player_radius
+                        + (0.5 if close_range_finish else 1.25)
+                    )
                     shot_lane_is_clear = (
-                        best_shot_clearance_squared >= 1.0 ** 2
+                        best_shot_clearance_squared
+                        >= required_shot_clearance ** 2
                     )
                     shooting_angle_is_good = (
                         abs(obs.ball.position[1] - goal_y)
@@ -740,22 +1009,73 @@ class MyTeam(TeamController):
                         if forward_teammates and rear_pressure_count < 3:
                             teammates = forward_teammates
 
-                        def pass_score(teammate):
+                        in_final_third = (
+                            player.position[0]
+                            >= obs.opponent_goal[0] - 30.0
+                        )
+                        carrier_under_close_pressure = any(
+                            self.distance_squared(
+                                player.position,
+                                opponent.position,
+                            ) <= 3.5 ** 2
+                            for opponent in obs.opponents
+                        )
+                        required_receiver_space = (
+                            3.5
+                            if (
+                                in_final_third
+                                and carrier_under_close_pressure
+                            )
+                            else 4.5 if in_final_third else 6.0
+                        )
+                        required_lane_clearance = (
+                            2.25 if in_final_third else 3.0
+                        )
+
+                        receiver_measurements = {}
+
+                        for teammate in teammates:
                             nearest_opponent_distance_squared = min(
-                                (
-                                    (teammate.position[0] - opponent.position[0]) ** 2
-                                    + (teammate.position[1] - opponent.position[1]) ** 2
+                                self.distance_squared(
+                                    teammate.position,
+                                    opponent.position,
                                 )
                                 for opponent in obs.opponents
                             )
+                            pass_distance_squared = self.distance_squared(
+                                teammate.position,
+                                player.position,
+                            )
+                            lane_clearance_squared = (
+                                self.lane_clearance_squared(
+                                    player.position,
+                                    teammate.position,
+                                    obs.opponents,
+                                )
+                            )
+                            receiver_measurements[teammate.id] = (
+                                nearest_opponent_distance_squared,
+                                pass_distance_squared,
+                                lane_clearance_squared,
+                            )
 
+                        def pass_score(teammate):
+                            (
+                                nearest_opponent_distance_squared,
+                                pass_distance_squared,
+                                lane_clearance_squared,
+                            ) = receiver_measurements[teammate.id]
+                            openness_score = min(
+                                nearest_opponent_distance_squared,
+                                100.0,
+                            )
+                            lane_score = min(
+                                lane_clearance_squared,
+                                100.0,
+                            )
                             forward_progress = (
                                 teammate.position[0]
                                 - player.position[0]
-                            )
-                            pass_distance_squared = (
-                                (teammate.position[0] - player.position[0]) ** 2
-                                + (teammate.position[1] - player.position[1]) ** 2
                             )
                             coordinated_run_bonus = 0.0
                             if teammate.id in coordinated_run_targets:
@@ -769,46 +1089,47 @@ class MyTeam(TeamController):
 
                             if rear_pressure_count >= 3:
                                 return (
-                                    2.0 * nearest_opponent_distance_squared
+                                    2.0 * openness_score
+                                    + 2.5 * lane_score
                                     + 3.0 * forward_progress
                                     - 0.15 * pass_distance_squared
                                     + coordinated_run_bonus
                                 )
 
                             return (
-                                nearest_opponent_distance_squared
+                                openness_score
+                                + 2.0 * lane_score
                                 + 6.0 * forward_progress
                                 - 0.25 * pass_distance_squared
                                 + coordinated_run_bonus
                             )
 
+                        safe_receivers = [
+                            teammate
+                            for teammate in teammates
+                            if (
+                                receiver_measurements[teammate.id][0]
+                                >= required_receiver_space ** 2
+                                and receiver_measurements[teammate.id][2]
+                                >= required_lane_clearance ** 2
+                            )
+                        ]
                         receiver = max(
-                            teammates,
+                            safe_receivers if safe_receivers else teammates,
                             key=pass_score,
                         )
-                        receiver_space_squared = min(
-                            (
-                                (receiver.position[0] - opponent.position[0]) ** 2
-                                + (receiver.position[1] - opponent.position[1]) ** 2
-                            )
-                            for opponent in obs.opponents
-                        )
+                        (
+                            receiver_space_squared,
+                            pass_length_squared,
+                            receiver_lane_clearance_squared,
+                        ) = receiver_measurements[receiver.id]
 
-                        in_final_third = (
-                            player.position[0]
-                            >= obs.opponent_goal[0] - 30.0
-                        )
-                        required_receiver_space = (
-                            4.5 if in_final_third else 6.0
-                        )
                         receiver_is_open = (
                             receiver_space_squared
                             >= required_receiver_space ** 2
                         )
                         receiver_is_within_range = (
-                            (receiver.position[0] - player.position[0]) ** 2
-                            + (receiver.position[1] - player.position[1]) ** 2
-                            <= 22.0 ** 2
+                            pass_length_squared <= 22.0 ** 2
                         )
                         opponents_near_carrier = sum(
                             1
@@ -819,59 +1140,10 @@ class MyTeam(TeamController):
                                 <= 12.0 ** 2
                             )
                         )
-                        # Check whether an opponent blocks the passing lane.
-                        pass_dx = receiver.position[0] - player.position[0]
-                        pass_dy = receiver.position[1] - player.position[1]
-
-                        pass_length_squared = (
-                            pass_dx * pass_dx
-                            + pass_dy * pass_dy
+                        pass_lane_is_clear = (
+                            receiver_lane_clearance_squared
+                            >= required_lane_clearance ** 2
                         )
-
-                        pass_lane_is_clear = True
-
-                        for opponent in obs.opponents:
-                            opponent_dx = (
-                                opponent.position[0]
-                                - player.position[0]
-                            )
-                            opponent_dy = (
-                                opponent.position[1]
-                                - player.position[1]
-                            )
-
-                            # Position of the opponent along the pass:
-                            # 0 = passer, 1 = receiver.
-                            t = (
-                                opponent_dx * pass_dx
-                                + opponent_dy * pass_dy
-                            ) / pass_length_squared
-
-                            if 0.0 < t < 1.0:
-                                closest_x = (
-                                    player.position[0]
-                                    + t * pass_dx
-                                )
-                                closest_y = (
-                                    player.position[1]
-                                    + t * pass_dy
-                                )
-
-                                distance_from_lane_squared = (
-                                    (opponent.position[0] - closest_x) ** 2
-                                    + (opponent.position[1] - closest_y) ** 2
-                                )
-
-                                required_lane_clearance = (
-                                    2.25 if in_final_third else 3.0
-                                )
-
-                                if (
-                                    distance_from_lane_squared
-                                    < required_lane_clearance ** 2
-                                ):
-                                    pass_lane_is_clear = False
-                                    break
 
                         receiver_is_forward = (
                             receiver.position[0] > player.position[0] + 3.0
@@ -885,12 +1157,20 @@ class MyTeam(TeamController):
                             and not shot_lane_is_clear
                             and receiver.position[0] >= player.position[0] - 10.0
                         )
+                        receiver_is_pressure_release = (
+                            in_final_third
+                            and carrier_under_close_pressure
+                            and pass_length_squared <= 12.0 ** 2
+                            and receiver.position[0]
+                            >= player.position[0] - 6.0
+                        )
 
                         if (
                             (
                                 receiver_is_forward
                                 or receiver_is_safe_escape
                                 or receiver_is_recycle_option
+                                or receiver_is_pressure_release
                             )
                             and receiver_is_open
                             and pass_lane_is_clear
@@ -918,6 +1198,8 @@ class MyTeam(TeamController):
 
                             if use_through_ball:
                                 pass_lead = 8.0
+                            elif receiver_is_pressure_release:
+                                pass_lead = 1.0
                             elif receiver_is_safe_escape:
                                 pass_lead = 2.0
                             elif receiver_is_recycle_option:
@@ -937,12 +1219,57 @@ class MyTeam(TeamController):
                             if receiver_has_completed_run:
                                 kick_target = coordinated_run_targets[receiver.id]
                             else:
+                                receiver_marker = min(
+                                    obs.opponents,
+                                    key=lambda opponent: (
+                                        (
+                                            opponent.position[0]
+                                            - receiver.position[0]
+                                        ) ** 2
+                                        + (
+                                            opponent.position[1]
+                                            - receiver.position[1]
+                                        ) ** 2
+                                    ),
+                                )
+                                receiver_marker_distance_squared = (
+                                    (
+                                        receiver_marker.position[0]
+                                        - receiver.position[0]
+                                    ) ** 2
+                                    + (
+                                        receiver_marker.position[1]
+                                        - receiver.position[1]
+                                    ) ** 2
+                                )
+                                pass_target_y = receiver.position[1]
+
+                                if receiver_marker_distance_squared <= 8.0 ** 2:
+                                    # Lead a marked receiver into the space on
+                                    # the opposite side of their defender.
+                                    marker_escape_direction = (
+                                        -1.0
+                                        if receiver_marker.position[1]
+                                        >= receiver.position[1]
+                                        else 1.0
+                                    )
+                                    pass_target_y += (
+                                        marker_escape_direction * 5.0
+                                    )
+                                    pass_target_y = max(
+                                        -obs.field.height / 2 + 3.0,
+                                        min(
+                                            pass_target_y,
+                                            obs.field.height / 2 - 3.0,
+                                        ),
+                                    )
+
                                 kick_target = (
                                     min(
                                         receiver.position[0] + pass_lead,
                                         obs.opponent_goal[0] - 2.0,
                                     ),
-                                    receiver.position[1],
+                                    pass_target_y,
                                 )
                             pass_distance = (
                                 (player.position[0] - kick_target[0]) ** 2
@@ -1028,7 +1355,11 @@ class MyTeam(TeamController):
 
                             dribble_y = max(lane_y_values, key=lane_score)
                             kick_target = (target_x, dribble_y)
-                            if obs.ball.position[0] >= 0.0:
+                            if in_final_third:
+                                # Keep the ball close enough to follow the
+                                # touch with a shot before the keeper arrives.
+                                kick_power = 0.20
+                            elif obs.ball.position[0] >= 0.0:
                                 kick_power = 0.30
                             else:
                                 kick_power = 0.25
@@ -1117,10 +1448,7 @@ class MyTeam(TeamController):
                     ).id
 
                 if ball_x > -5.0 and not protecting_late_result:
-                    if ball_y < 0:
-                        attacking_midfielder_id = 1
-                    else:
-                        attacking_midfielder_id = 2
+                    attacking_midfielder_id = role_support.id
 
                 if player.id in coordinated_run_targets:
                     # In the final third, supporting attackers make distinct
@@ -1163,31 +1491,78 @@ class MyTeam(TeamController):
                     target_x = -10.0
                     target_y = 10.0
 
-                elif player.id == 1:
-                    # Left defender: remain behind the ball.
+                elif dynamic_roles[player.id] == "defender":
+                    # The current deepest outfielder protects the attack.
                     target_x = min(ball_x - 12.0, -5.0)
-                    target_y = -12.0
+                    target_y = (
+                        -12.0 if player.position[1] <= 0.0 else 12.0
+                    )
 
-                elif player.id == 2:
-                    # Right defender: remain behind the ball.
-                    target_x = min(ball_x - 12.0, -5.0)
-                    target_y = 12.0
-
-                elif player.id == 3:
-                    # Left attacker: move ahead of the ball.
+                elif dynamic_roles[player.id] == "striker":
+                    # The current furthest outfielder stays ahead and changes
+                    # lanes whenever possession is regained.
                     target_x = min(
-                        ball_x + 10.0,
+                        ball_x + 12.0,
                         obs.field.opponent_goal[0] - 5.0,
                     )
-                    target_y = -10.0
+                    target_y = (
+                        10.0
+                        if self.attacking_lane_phase == 1
+                        else -10.0
+                    )
 
                 else:
-                    # Player 4 — right attacker.
+                    # The support player occupies the opposite lane, close
+                    # enough to contest an incomplete pass or loose touch.
                     target_x = min(
-                        ball_x + 10.0,
-                        obs.field.opponent_goal[0] - 5.0,
+                        ball_x + 5.0,
+                        obs.field.opponent_goal[0] - 9.0,
                     )
-                    target_y = 10.0
+                    target_y = (
+                        -10.0
+                        if self.attacking_lane_phase == 1
+                        else 10.0
+                    )
+
+                if (
+                    dynamic_roles[player.id] in ("support", "striker")
+                    and player.id not in coordinated_run_targets
+                    and player.id != rebound_supporter_id
+                    and not protecting_late_result
+                ):
+                    marker = min(
+                        obs.opponents,
+                        key=lambda opponent: (
+                            (opponent.position[0] - player.position[0]) ** 2
+                            + (opponent.position[1] - player.position[1]) ** 2
+                        ),
+                    )
+                    marker_distance_squared = (
+                        (marker.position[0] - player.position[0]) ** 2
+                        + (marker.position[1] - player.position[1]) ** 2
+                    )
+
+                    if marker_distance_squared <= 8.0 ** 2:
+                        # A tightly followed attacker cuts away from their
+                        # marker while continuing forward. This creates a
+                        # moving passing lane instead of asking for the ball
+                        # with the defender standing beside the receiver.
+                        escape_direction = (
+                            -1.0
+                            if marker.position[1] >= player.position[1]
+                            else 1.0
+                        )
+                        target_x = min(
+                            max(target_x, player.position[0] + 6.0),
+                            obs.opponent_goal[0] - 7.0,
+                        )
+                        target_y = max(
+                            -obs.field.height / 2 + 3.0,
+                            min(
+                                target_y + escape_direction * 8.0,
+                                obs.field.height / 2 - 3.0,
+                            ),
+                        )
 
                 support_target = (target_x, target_y)
 
@@ -1196,9 +1571,31 @@ class MyTeam(TeamController):
                     direction(player.position, support_target),
                 )
 
+            elif (
+                player.id == self.second_ball_player_id
+                and obs.tick <= self.second_ball_until
+                and not nearest
+            ):
+                # Commit briefly to the second ball, then return to the
+                # current dynamic role if possession has not been recovered.
+                actions.move(
+                    player.id,
+                    direction(player.position, obs.ball.position),
+                )
+
             elif nearest:
-                # Theirs, and I am the closest: go and win it back.
-                actions.move(player.id, direction(player.position, obs.ball.position))
+                # Theirs, and I am the closest: close down the carrier and
+                # actively play the ball as soon as it enters kicking range.
+                if obs.can_kick(player.id):
+                    actions.set(
+                        player.id,
+                        self.defensive_challenge_action(obs, player),
+                    )
+                else:
+                    actions.move(
+                        player.id,
+                        direction(player.position, obs.ball.position),
+                    )
 
                 "Theirs, and somebody else is closer: get behind the ball."
             else:
@@ -1222,37 +1619,37 @@ class MyTeam(TeamController):
                     target_x = -10.0
                     target_y = 10.0
 
-                elif player.id == 1:
-                    # Left defender.
+                elif dynamic_roles[player.id] == "defender":
+                    # The deepest available outfielder protects the goal.
                     target_x = max(
                         goal_x + 8.0,
                         min(ball_x - 8.0, -20.0),
                     )
-                    target_y = (ball_y - 12.0) / 2
+                    target_y = ball_y * 0.35
 
-                elif player.id == 2:
-                    # Right defender.
+                elif dynamic_roles[player.id] == "support":
+                    # Stay close behind the defensive contest instead of
+                    # waiting in midfield while the chaser and defender face
+                    # the attack alone.
                     target_x = max(
-                        goal_x + 8.0,
-                        min(ball_x - 8.0, -20.0),
+                        goal_x + 18.0,
+                        min(ball_x - 3.0, 0.0),
                     )
-                    target_y = (ball_y + 12.0) / 2
-
-                elif player.id == 3:
-                    # Left attacker drops into midfield.
-                    target_x = max(
-                        -18.0,
-                        min(ball_x - 4.0, 0.0),
+                    target_y = max(
+                        -12.0,
+                        min(ball_y * 0.6, 12.0),
                     )
-                    target_y = -10.0
 
                 else:
-                    # Player 4 — right attacker drops into midfield.
+                    # Preserve one outlet instead of dropping everybody onto
+                    # the ball and carrying every marker toward our goal.
                     target_x = max(
-                        -18.0,
-                        min(ball_x - 4.0, 0.0),
+                        -10.0,
+                        min(ball_x + 2.0, 8.0),
                     )
-                    target_y = 10.0
+                    target_y = (
+                        -10.0 if player.position[1] <= 0.0 else 10.0
+                    )
 
                 defensive_target = (target_x, target_y)
 
